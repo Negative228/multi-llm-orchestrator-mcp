@@ -3,7 +3,9 @@ from fastmcp import FastMCP, Context
 import logging
 
 from pydantic import BaseModel
-from orchestrator import orchestrator_app, format_status_report
+from langchain_core.callbacks import get_usage_metadata_callback
+from orchestrator import (TaskState, orchestrator_app, format_status_report,
+                          format_usage_report)
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,7 @@ async def solve_task(request: SolveTaskRequest, ctx: Context = None) -> str:
 
     План и прогресс выполнения подзадач отправляются клиенту по ходу работы.
     """
-    initial_state = {
+    initial_state: TaskState = {
         "original_task": request.task,
         "plan": [],
         "depends_on": [],
@@ -49,14 +51,19 @@ async def solve_task(request: SolveTaskRequest, ctx: Context = None) -> str:
                 message=f"{event['index'] + 1}. {event['description']} — {event['status']}",
             )
 
+    usage_cb = None
     try:
-        # Асинхронный вызов графа
-        result = await orchestrator_app.ainvoke(
-            initial_state, config={"configurable": {"on_progress": on_progress}})
+        with get_usage_metadata_callback() as usage_cb:
+            # Асинхронный вызов графа
+            result = await orchestrator_app.ainvoke(
+                initial_state, config={"configurable": {"on_progress": on_progress}})
     except Exception:
         logger.exception("Ошибка при выполнении оркестратора")
-        return "Не удалось обратиться к LLM после нескольких попыток. Попробуйте повторить запрос позже."
+        usage = format_usage_report(usage_cb.usage_metadata if usage_cb else {})
+        return (f"Не удалось обратиться к LLM после нескольких попыток. "
+                f"Попробуйте повторить запрос позже.\n\n{usage}")
 
+    usage = format_usage_report(usage_cb.usage_metadata if usage_cb else {})
     report = format_status_report(
         request.task,
         result.get("plan") or [],
@@ -64,11 +71,11 @@ async def solve_task(request: SolveTaskRequest, ctx: Context = None) -> str:
         result.get("revision_count") or 1,
     )
     if result.get("final_answer"):
-        return f"{report}\n\n=== ОТВЕТ ===\n{result['final_answer']}"
+        return f"{report}\n\n=== ОТВЕТ ===\n{result['final_answer']}\n\n{usage}"
     message = f"{report}\n\nНе удалось получить удовлетворительный результат."
     if result.get("feedback"):
         message += f"\nПоследние замечания ревьюера: {result['feedback']}"
-    return message
+    return f"{message}\n\n{usage}"
 
 if __name__ == "__main__":
     mcp.run()  # По умолчанию запускается через STDIO

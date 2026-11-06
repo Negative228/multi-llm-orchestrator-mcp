@@ -1,10 +1,12 @@
 # test_client.py
 import asyncio
-from orchestrator import orchestrator_app, format_status_report
+from langchain_core.callbacks import get_usage_metadata_callback
+from orchestrator import (TaskState, orchestrator_app, format_status_report,
+                          format_usage_report)
 
 async def main():
     task = input("Введите задачу: ")
-    initial_state = {
+    initial_state: TaskState = {
         "original_task": task,
         "plan": [],
         "depends_on": [],
@@ -24,11 +26,15 @@ async def main():
         elif event["type"] == "status":
             print(f"  [{event['index'] + 1}] {event['description']} — {event['status']}")
 
+    usage_cb = None
     try:
-        result = await orchestrator_app.ainvoke(
-            initial_state, config={"configurable": {"on_progress": on_progress}})
+        with get_usage_metadata_callback() as usage_cb:
+            result = await orchestrator_app.ainvoke(
+                initial_state, config={"configurable": {"on_progress": on_progress}})
     except Exception as e:
         print(f"\nОшибка при обращении к LLM: {e}")
+        print()
+        print(format_usage_report(usage_cb.usage_metadata if usage_cb else {}))
         return
 
     print("\n=== ИТОГОВЫЙ ОТВЕТ ===")
@@ -39,6 +45,8 @@ async def main():
         if result.get("feedback"):
             print(f"\nПоследние замечания ревьюера: {result['feedback']}")
     print(f"\n(итераций ревью: {result['revision_count']})")
+    print()
+    print(format_usage_report(usage_cb.usage_metadata if usage_cb else {}))
 
 if __name__ == "__main__":
     asyncio.run(main())

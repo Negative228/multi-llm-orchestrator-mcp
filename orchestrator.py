@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from typing import TypedDict, List, Optional
+from langchain_core.callbacks import get_usage_metadata_callback
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
@@ -138,6 +139,33 @@ def format_status_report(task: str, plan: List[str], statuses: List[str], iterat
         lines.append(f"{i + 1}. {subtask} - \"{status}\"")
     return "\n".join(lines)
 
+def format_usage_report(usage_metadata: dict) -> str:
+    """Сводка по токенам: usage_metadata из UsageMetadataCallbackHandler -> текст.
+
+    Ключи — имена моделей, значения — UsageMetadata (input/output/total_tokens
+    плюс детализация cache_read и reasoning).
+    """
+    if not usage_metadata:
+        return "Расход токенов: нет данных"
+    lines = ["Расход токенов:"]
+    sum_in = sum_out = 0
+    for model, usage in usage_metadata.items():
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        sum_in += inp
+        sum_out += out
+        in_det = usage.get("input_token_details") or {}
+        out_det = usage.get("output_token_details") or {}
+        extras = []
+        if in_det.get("cache_read"):
+            extras.append(f"из кеша {in_det['cache_read']}")
+        if out_det.get("reasoning"):
+            extras.append(f"reasoning {out_det['reasoning']}")
+        extra = f" ({', '.join(extras)})" if extras else ""
+        lines.append(f"  {model}: вход {inp}, выход {out}{extra}")
+    lines.append(f"  ИТОГО: вход {sum_in}, выход {sum_out}, всего {sum_in + sum_out}")
+    return "\n".join(lines)
+
 # --- Узлы графа ---
 async def planner_node(state: TaskState, config=None):
     feedback = state.get("feedback")
@@ -156,28 +184,35 @@ async def planner_node(state: TaskState, config=None):
                 preview = result[:RESULT_PREVIEW_LEN] + "…"
             note = old_reviews[i] if i < len(old_reviews) and old_reviews[i] else "—"
             previous.append(f"{i}. {subtask}\n   Результат: {preview}\n   Предварительная проверка: {note}")
-        prompt = f"""Ты — архитектор. Ревьюер остался недоволен результатом работы — перепланируй задачу.
-Исходная задача: {state['original_task']}
+        prompt = f"""
+        Ты — архитектор. Ревьюер остался недоволен результатом работы — перепланируй задачу.
+        Исходная задача: {state['original_task']}
 
-Предыдущий план, результаты подзадач и их предварительная проверка:
-{chr(10).join(previous)}
+        Предыдущий план, результаты подзадач и их предварительная проверка:
+        {chr(10).join(previous)}
 
-Замечания ревьюера: {feedback}
+        Замечания ревьюера: {feedback}
 
-Верни исправленный план целиком. Оставь без изменений подзадачи, результаты которых не требуют
-доработки — для них укажи reuse_result_from (индекс подзадачи из предыдущего плана, чей результат
-переиспользуется). Переформулируй или добавь только те подзадачи, на которые указывают замечания.
-Для каждой подзадачи укажи depends_on — индексы подзадач, результаты которых ей нужны (пусто —
-подзадача независима и может выполняться параллельно с другими)."""
+        Верни исправленный план целиком. Оставь без изменений подзадачи, результаты которых не требуют
+        доработки — для них укажи reuse_result_from (индекс подзадачи из предыдущего плана, чей результат
+        переиспользуется). Переформулируй или добавь только те подзадачи, на которые указывают замечания.
+        Для каждой подзадачи укажи depends_on — индексы подзадач, результаты которых ей нужны (пусто —
+        подзадача независима и может выполняться параллельно с другими).
+        """
     else:
-        prompt = f"""Ты — архитектор. Разбей следующую задачу на последовательность небольших,
-конкретных подзадач, которые сможет выполнить другая, менее мощная модель.
-Задача: {state['original_task']}
-Для каждой подзадачи укажи depends_on — индексы подзадач (с 0), результаты которых ей нужны.
-Если подзадачи полностью независимы друг от друга (например, анализ нескольких источников),
-оставь depends_on пустым — тогда они будут выполняться параллельно. Если подзадача строится
-на результатах предыдущих (например, шаги вычислений), укажи эти индексы.
-Верни только список подзадач."""
+        prompt = f"""
+        Ты — архитектор. Разбей следующую задачу на последовательность небольших,
+        конкретных подзадач, которые сможет выполнить другая, менее мощная модель.
+        Подзадачи не должны включать в себя проверку собственных результатов или
+        результатов, полученных в других подзадачах, если об этом напрямую 
+        не указано в формулировке задачи.
+        Задача: {state['original_task']}
+        Для каждой подзадачи укажи depends_on — индексы подзадач (с 0), результаты которых ей нужны.
+        Если подзадачи полностью независимы друг от друга (например, анализ нескольких источников),
+        оставь depends_on пустым — тогда они будут выполняться параллельно. Если подзадача строится
+        на результатах предыдущих (например, шаги вычислений), укажи эти индексы.
+        Верни только список подзадач.
+        """
 
     def _validate(plan):
         if not plan.subtasks:
@@ -246,16 +281,18 @@ async def executor_node(state: TaskState, config=None):
     async def preliminary_review(i: int, result: str, dep_indices: List[int]):
         # Пошаговая проверка запускается сразу и работает параллельно с выполнением следующих подзадач
         dep_lines = "\n".join(f"{d}. {plan[d]}: {results[d] or '—'}" for d in dep_indices) or "нет"
-        prompt = f"""Ты — ревьюер. Проверь только эту подзадачу и её результат.
-Общая задача: {state['original_task']}
-Подзадача {i}: {plan[i]}
-Результат: {result}
-Результаты подзадач, от которых она зависит:
-{dep_lines}
-Если результат некорректен или неполон, укажи, что именно нужно исправить."""
+        prompt = f"""
+        Ты — ревьюер. Проверь только эту подзадачу и её результат.
+        Подзадача {i}: {plan[i]}
+        Результат: {result}
+        Результаты подзадач, от которых она зависит:
+        {dep_lines}
+        Если результат некорректен или неполон, укажи, что именно нужно исправить.
+        """
+        # Общая задача: {state['original_task']}
         try:
-            async with review_sem:
-                rev = await ainvoke_with_retry(planner_llm, prompt, schema=SubtaskReview)
+            async with review_sem:              # planner_llm
+                rev = await ainvoke_with_retry(executor_llm, prompt, schema=SubtaskReview)
             if rev.is_satisfactory:
                 reviews[i] = "OK"
                 await set_status(i, STATUS_OK)
@@ -275,11 +312,16 @@ async def executor_node(state: TaskState, config=None):
             if task is not None:
                 await task
         dep_lines = "\n".join(f"{d}. {plan[d]}: {results[d] or '—'}" for d in dep_indices)
-        prompt = f"""Выполни подзадачу в рамках общей задачи.
-Общая задача: {state['original_task']}
-Подзадача: {plan[i]}"""
+        prompt = f"""
+        Выполни подзадачу в рамках общей задачи.
+        Не добавляй пояснений/примеров, если это прямо не указано в твоей подзадаче.
+        Подзадача (необходимо выполнить): {plan[i]}
+        """
+        # Общая задача (для справки): {state['original_task']}
         if dep_indices:
-            prompt += f"\nРезультаты подзадач, от которых она зависит:\n{dep_lines}"
+            prompt += f"""
+            \nРезультаты подзадач, от которых она зависит:\n{dep_lines}
+            Верни только новый/измененный фрагмент, без повторения результатов других подзадач, если не указано обратное"""
         else:
             prompt += "\nПодзадача не зависит от других подзадач."
         await set_status(i, STATUS_IN_PROGRESS)
@@ -330,14 +372,16 @@ async def reviewer_node(state: TaskState, config=None):
         for i in range(len(plan))
     )
 
-    prompt = f"""Ты — строгий ревьюер. Оцени, решают ли предоставленные результаты исходную задачу.
-Пошаговая проверка каждой подзадачи уже проведена (см. предварительную проверку) — учти её замечания
-и проверь итог целиком. Если результат неудовлетворителен, подробно укажи, что именно не так
-и какие подзадачи нужно перепланировать и переделать.
-Если результат удовлетворителен — собери из результатов подзадач единый итоговый ответ пользователю
-(final_answer): объедини их в один цельный документ, убрав повторы и дублирование кода (один и тот же
-код не должен встречаться дважды), без своих дополнительных комментариев.
-{context}"""
+    prompt = f"""
+    Ты — строгий ревьюер. Оцени, решают ли предоставленные результаты исходную задачу.
+    Пошаговая проверка каждой подзадачи уже проведена (см. предварительную проверку) — учти её замечания
+    и проверь итог целиком. Если результат неудовлетворителен, подробно укажи, что именно не так
+    и какие подзадачи нужно перепланировать и переделать.
+    Если результат удовлетворителен — собери из результатов подзадач единый итоговый ответ пользователю
+    (final_answer): объедини их в один цельный документ, убрав повторы и дублирование кода (один и тот же
+    код не должен встречаться дважды), без своих дополнительных комментариев.
+    {context}
+    """
 
     def _validate(review):
         if review.is_satisfactory and not review.final_answer.strip():
