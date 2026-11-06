@@ -7,6 +7,7 @@ load_dotenv()
 
 from typing import TypedDict, List, Optional
 from langchain_core.callbacks import get_usage_metadata_callback
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
@@ -89,16 +90,57 @@ class ReviewResult(BaseModel):
                                           "ответ без повторов и дублирования кода (каждый фрагмент кода — только один раз). "
                                           "Пусто, если результат неудовлетворителен")
 
+# --- Постоянные части промптов (SystemMessage) ---
+# Инструкции вынесены в константы ради кеширования префикса у провайдера:
+# чем стабильнее начальная часть запроса между вызовами, тем больше токенов
+# берётся из кеша (см. cache_read в usage-отчёте). Переменные данные (задача,
+# подзадачи, результаты) идут только в HumanMessage.
+PLANNER_SYSTEM = """Ты — архитектор. Разбей следующую задачу на последовательность небольших,
+конкретных подзадач, которые сможет выполнить другая, менее мощная модель.
+Подзадачи не должны включать в себя проверку собственных результатов или
+результатов, полученных в других подзадачах, если об этом напрямую
+не указано в формулировке задачи.
+Для каждой подзадачи укажи depends_on — индексы подзадач (с 0), результаты которых ей нужны.
+Если подзадачи полностью независимы друг от друга (например, анализ нескольких источников),
+оставь depends_on пустым — тогда они будут выполняться параллельно. Если подзадача строится
+на результатах предыдущих (например, шаги вычислений), укажи эти индексы.
+Верни только список подзадач."""
+
+PLANNER_REPLAN_SYSTEM = """Ты — архитектор. Ревьюер остался недоволен результатом работы — перепланируй задачу.
+Верни исправленный план целиком. Оставь без изменений подзадачи, результаты которых не требуют
+доработки — для них укажи reuse_result_from (индекс подзадачи из предыдущего плана, чей результат
+переиспользуется). Переформулируй или добавь только те подзадачи, на которые указывают замечания.
+Для каждой подзадачи укажи depends_on — индексы подзадач, результаты которых ей нужны (пусто —
+подзадача независима и может выполняться параллельно с другими)."""
+
+EXECUTOR_SYSTEM = """Выполни подзадачу в рамках общей задачи.
+Не добавляй пояснений/примеров, если это прямо не указано в твоей подзадаче."""
+
+SUBTASK_REVIEW_SYSTEM = """Ты — ревьюер. Проверь только эту подзадачу и её результат.
+Если результат некорректен или неполон, укажи, что именно нужно исправить."""
+
+FINAL_REVIEW_SYSTEM = """Ты — строгий ревьюер. Оцени, решают ли предоставленные результаты исходную задачу.
+Пошаговая проверка каждой подзадачи уже проведена (см. предварительную проверку) — учти её замечания
+и проверь итог целиком. Если результат неудовлетворителен, подробно укажи, что именно не так
+и какие подзадачи нужно перепланировать и переделать.
+Если результат удовлетворителен — собери из результатов подзадач единый итоговый ответ пользователю
+(final_answer): объедини их в один цельный документ, убрав повторы и дублирование кода (один и тот же
+код не должен встречаться дважды), без своих дополнительных комментариев."""
+
 # --- Устойчивый вызов LLM ---
-async def ainvoke_with_retry(llm, prompt, schema=None, validate=None, max_attempts=MAX_LLM_ATTEMPTS):
-    """Вызов LLM с повторами при ошибках API, пустом ответе и некорректном JSON."""
+async def ainvoke_with_retry(llm, messages, schema=None, validate=None, max_attempts=MAX_LLM_ATTEMPTS):
+    """Вызов LLM с повторами при ошибках API, пустом ответе и некорректном JSON.
+
+    messages — строка или список сообщений (SystemMessage + HumanMessage):
+    постоянная часть промпта выносится в SystemMessage ради кеширования префикса.
+    """
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             if schema is not None:
-                result = await llm.with_structured_output(schema).ainvoke(prompt)
+                result = await llm.with_structured_output(schema).ainvoke(messages)
             else:
-                result = await llm.ainvoke(prompt)
+                result = await llm.ainvoke(messages)
                 if not str(result.content or "").strip():
                     raise ValueError("модель вернула пустой ответ")
             if validate is not None:
@@ -166,6 +208,44 @@ def format_usage_report(usage_metadata: dict) -> str:
     lines.append(f"  ИТОГО: вход {sum_in}, выход {sum_out}, всего {sum_in + sum_out}")
     return "\n".join(lines)
 
+def build_partial_answer(state: TaskState, note: str = "") -> str:
+    """Частичный ответ из уже полученных результатов, когда задача решена не полностью.
+
+    Включает содержимое всех выполненных подзадач (с пометкой статуса, если не OK),
+    перечисляет невыполненные и добавляет замечания ревьюера.
+    """
+    plan = state.get("plan") or []
+    results = state.get("results") or []
+    statuses = state.get("subtask_statuses") or []
+    reviews = state.get("subtask_reviews") or []
+
+    done, flagged, missing = [], [], []
+    for i, res in enumerate(results):
+        desc = plan[i] if i < len(plan) else f"подзадача {i}"
+        status = statuses[i] if i < len(statuses) else STATUS_PENDING
+        review_note = reviews[i] if i < len(reviews) else None
+        if res is None:
+            missing.append(f"{i + 1}. {desc} - \"{status}\"")
+        elif status in (STATUS_OK, STATUS_REUSED):
+            done.append(f"{i + 1}. {desc}\n{res}")
+        else:
+            comment = f" - \"{status}\"" + (f" ({review_note})" if review_note else "")
+            flagged.append(f"{i + 1}. {desc}{comment}\n{res}")
+
+    if not (done or flagged or missing):
+        return ""
+
+    parts = ["⚠ ЧАСТИЧНЫЙ РЕЗУЛЬТАТ — задача решена не полностью, ниже показано то, что получилось."]
+    if done:
+        parts.append("\n\n".join(done))
+    if flagged:
+        parts.append("Подзадачи с замечаниями (содержимое может быть неполным):\n\n" + "\n\n".join(flagged))
+    if missing:
+        parts.append("Не выполнены:\n" + "\n".join(missing))
+    if note:
+        parts.append(f"Замечания ревьюера: {note}")
+    return "\n\n".join(parts)
+
 # --- Узлы графа ---
 async def planner_node(state: TaskState, config=None):
     feedback = state.get("feedback")
@@ -184,41 +264,38 @@ async def planner_node(state: TaskState, config=None):
                 preview = result[:RESULT_PREVIEW_LEN] + "…"
             note = old_reviews[i] if i < len(old_reviews) and old_reviews[i] else "—"
             previous.append(f"{i}. {subtask}\n   Результат: {preview}\n   Предварительная проверка: {note}")
-        prompt = f"""
-        Ты — архитектор. Ревьюер остался недоволен результатом работы — перепланируй задачу.
-        Исходная задача: {state['original_task']}
+        messages = [
+            SystemMessage(content=PLANNER_REPLAN_SYSTEM),
+            HumanMessage(content=f"""Исходная задача: {state['original_task']}
 
-        Предыдущий план, результаты подзадач и их предварительная проверка:
-        {chr(10).join(previous)}
+Предыдущий план, результаты подзадач и их предварительная проверка:
+{chr(10).join(previous)}
 
-        Замечания ревьюера: {feedback}
-
-        Верни исправленный план целиком. Оставь без изменений подзадачи, результаты которых не требуют
-        доработки — для них укажи reuse_result_from (индекс подзадачи из предыдущего плана, чей результат
-        переиспользуется). Переформулируй или добавь только те подзадачи, на которые указывают замечания.
-        Для каждой подзадачи укажи depends_on — индексы подзадач, результаты которых ей нужны (пусто —
-        подзадача независима и может выполняться параллельно с другими).
-        """
+Замечания ревьюера: {feedback}"""),
+        ]
     else:
-        prompt = f"""
-        Ты — архитектор. Разбей следующую задачу на последовательность небольших,
-        конкретных подзадач, которые сможет выполнить другая, менее мощная модель.
-        Подзадачи не должны включать в себя проверку собственных результатов или
-        результатов, полученных в других подзадачах, если об этом напрямую 
-        не указано в формулировке задачи.
-        Задача: {state['original_task']}
-        Для каждой подзадачи укажи depends_on — индексы подзадач (с 0), результаты которых ей нужны.
-        Если подзадачи полностью независимы друг от друга (например, анализ нескольких источников),
-        оставь depends_on пустым — тогда они будут выполняться параллельно. Если подзадача строится
-        на результатах предыдущих (например, шаги вычислений), укажи эти индексы.
-        Верни только список подзадач.
-        """
+        messages = [
+            SystemMessage(content=PLANNER_SYSTEM),
+            HumanMessage(content=f"Задача: {state['original_task']}"),
+        ]
 
     def _validate(plan):
         if not plan.subtasks:
             raise ValueError("Planner вернул пустой план")
 
-    plan = await ainvoke_with_retry(planner_llm, prompt, schema=Plan, validate=_validate)
+    try:
+        plan = await ainvoke_with_retry(planner_llm, messages, schema=Plan, validate=_validate)
+    except Exception as e:
+        if not feedback:
+            raise  # первое планирование — спасти нечего
+        # Доработка невозможна (планировщик недоступен) — отдаём уже полученное
+        logger.error("Перепланирование не удалось, возвращаем частичный результат: %s", e)
+        partial = build_partial_answer(
+            state, note=f"доработка не удалась (планировщик не ответил): {e}")
+        if not partial:
+            raise
+        return {"final_answer": partial, "feedback": None,
+                "revision_count": state.get("revision_count", 0)}
 
     # Собираем новый план; результаты и проверки удачных подзадач переиспользуем из прошлой итерации
     old_results = state.get("results") or []
@@ -281,18 +358,17 @@ async def executor_node(state: TaskState, config=None):
     async def preliminary_review(i: int, result: str, dep_indices: List[int]):
         # Пошаговая проверка запускается сразу и работает параллельно с выполнением следующих подзадач
         dep_lines = "\n".join(f"{d}. {plan[d]}: {results[d] or '—'}" for d in dep_indices) or "нет"
-        prompt = f"""
-        Ты — ревьюер. Проверь только эту подзадачу и её результат.
-        Подзадача {i}: {plan[i]}
-        Результат: {result}
-        Результаты подзадач, от которых она зависит:
-        {dep_lines}
-        Если результат некорректен или неполон, укажи, что именно нужно исправить.
-        """
         # Общая задача: {state['original_task']}
+        messages = [
+            SystemMessage(content=SUBTASK_REVIEW_SYSTEM),
+            HumanMessage(content=f"""Подзадача {i}: {plan[i]}
+Результат: {result}
+Результаты подзадач, от которых она зависит:
+{dep_lines}"""),
+        ]
         try:
-            async with review_sem:              # planner_llm
-                rev = await ainvoke_with_retry(executor_llm, prompt, schema=SubtaskReview)
+            async with review_sem:
+                rev = await ainvoke_with_retry(executor_llm, messages, schema=SubtaskReview)
             if rev.is_satisfactory:
                 reviews[i] = "OK"
                 await set_status(i, STATUS_OK)
@@ -312,22 +388,23 @@ async def executor_node(state: TaskState, config=None):
             if task is not None:
                 await task
         dep_lines = "\n".join(f"{d}. {plan[d]}: {results[d] or '—'}" for d in dep_indices)
-        prompt = f"""
-        Выполни подзадачу в рамках общей задачи.
-        Не добавляй пояснений/примеров, если это прямо не указано в твоей подзадаче.
-        Подзадача (необходимо выполнить): {plan[i]}
-        """
         # Общая задача (для справки): {state['original_task']}
+        user_prompt = f"Подзадача (необходимо выполнить): {plan[i]}"
         if dep_indices:
-            prompt += f"""
-            \nРезультаты подзадач, от которых она зависит:\n{dep_lines}
-            Верни только новый/измененный фрагмент, без повторения результатов других подзадач, если не указано обратное"""
+            user_prompt += f"""
+Результаты подзадач, от которых она зависит:
+{dep_lines}
+Верни только новый/измененный фрагмент, без повторения результатов других подзадач, если не указано обратное"""
         else:
-            prompt += "\nПодзадача не зависит от других подзадач."
+            user_prompt += "\nПодзадача не зависит от других подзадач."
+        messages = [
+            SystemMessage(content=EXECUTOR_SYSTEM),
+            HumanMessage(content=user_prompt),
+        ]
         await set_status(i, STATUS_IN_PROGRESS)
         try:
             async with exec_sem:
-                response = await ainvoke_with_retry(executor_llm, prompt)
+                response = await ainvoke_with_retry(executor_llm, messages)
         except Exception as e:
             # Не роняем весь прогон: помечаем подзадачу, ревью отклонит результат
             # и цикл доработки попробует выполнить её заново.
@@ -347,13 +424,12 @@ async def executor_node(state: TaskState, config=None):
             futures[i] = asyncio.create_task(run_subtask(i))
 
     outcomes = await asyncio.gather(*futures.values(), return_exceptions=True)
-    error = next((o for o in outcomes if isinstance(o, Exception)), None)
-    if error is not None:
-        for t in review_tasks:
-            t.cancel()
-        if review_tasks:
-            await asyncio.gather(*review_tasks, return_exceptions=True)
-        raise error
+    for (i, _), outcome in zip(list(futures.items()), outcomes):
+        if isinstance(outcome, Exception):
+            # Неожиданная ошибка одной подзадачи не должна терять результаты остальных
+            logger.error("Подзадача %d завершилась неожиданной ошибкой: %s", i, outcome)
+            results[i] = None
+            await set_status(i, STATUS_ERROR)
     if review_tasks:
         await asyncio.gather(*review_tasks, return_exceptions=True)
     return {"results": results, "subtask_reviews": reviews, "subtask_statuses": statuses}
@@ -371,29 +447,37 @@ async def reviewer_node(state: TaskState, config=None):
         f"{i}. {plan[i]}: {notes[i] if i < len(notes) and notes[i] else 'не проверялось'}"
         for i in range(len(plan))
     )
-
-    prompt = f"""
-    Ты — строгий ревьюер. Оцени, решают ли предоставленные результаты исходную задачу.
-    Пошаговая проверка каждой подзадачи уже проведена (см. предварительную проверку) — учти её замечания
-    и проверь итог целиком. Если результат неудовлетворителен, подробно укажи, что именно не так
-    и какие подзадачи нужно перепланировать и переделать.
-    Если результат удовлетворителен — собери из результатов подзадач единый итоговый ответ пользователю
-    (final_answer): объедини их в один цельный документ, убрав повторы и дублирование кода (один и тот же
-    код не должен встречаться дважды), без своих дополнительных комментариев.
-    {context}
-    """
+    messages = [
+        SystemMessage(content=FINAL_REVIEW_SYSTEM),
+        HumanMessage(content=context),
+    ]
 
     def _validate(review):
         if review.is_satisfactory and not review.final_answer.strip():
             raise ValueError("Reviewer одобрил результат, но не вернул итоговый ответ")
 
-    review = await ainvoke_with_retry(planner_llm, prompt, schema=ReviewResult, validate=_validate)
+    next_revision = state.get("revision_count", 0) + 1
+    try:
+        review = await ainvoke_with_retry(planner_llm, messages, schema=ReviewResult, validate=_validate)
+    except Exception as e:
+        # Итоговая проверка недоступна — возвращаем хотя бы уже полученное
+        logger.error("Итоговое ревью не удалось, возвращаем частичный результат: %s", e)
+        partial = build_partial_answer(state, note=f"итоговая проверка не удалась: {e}")
+        if not partial:
+            raise
+        return {"final_answer": partial, "feedback": f"итоговая проверка не удалась: {e}",
+                "revision_count": next_revision}
+
     satisfactory = review.is_satisfactory
-    return {
-        "final_answer": review.final_answer.strip() if satisfactory else None,
-        "feedback": None if satisfactory else review.feedback,
-        "revision_count": state.get("revision_count", 0) + 1,
-    }
+    if satisfactory:
+        return {"final_answer": review.final_answer.strip(), "feedback": None,
+                "revision_count": next_revision}
+    if next_revision >= MAX_REVISIONS:
+        # Итерации исчерпаны — возвращаем частичный результат вместе с замечаниями
+        partial = build_partial_answer(state, note=review.feedback)
+        return {"final_answer": partial or None, "feedback": review.feedback,
+                "revision_count": next_revision}
+    return {"final_answer": None, "feedback": review.feedback, "revision_count": next_revision}
 
 def should_continue(state: TaskState):
     if state.get("final_answer"):
@@ -402,6 +486,10 @@ def should_continue(state: TaskState):
         return "end"
     return "revise"
 
+def after_planner(state: TaskState):
+    # Планировщик мог вернуть частичный результат (доработка не удалась) — тогда завершаем
+    return "end" if state.get("final_answer") else "executor"
+
 # --- Сборка графа ---
 workflow = StateGraph(TaskState)
 workflow.add_node("planner", planner_node)
@@ -409,7 +497,11 @@ workflow.add_node("executor", executor_node)
 workflow.add_node("reviewer", reviewer_node)
 
 workflow.set_entry_point("planner")
-workflow.add_edge("planner", "executor")
+workflow.add_conditional_edges(
+    "planner",
+    after_planner,
+    {"end": END, "executor": "executor"},
+)
 workflow.add_edge("executor", "reviewer")
 workflow.add_conditional_edges(
     "reviewer",
