@@ -4,12 +4,22 @@ import logging
 
 from pydantic import BaseModel
 from langchain_core.callbacks import get_usage_metadata_callback
-from orchestrator import (TaskState, orchestrator_app, format_status_report,
-                          format_usage_report)
+from orchestrator import    (TaskState, 
+                            format_status_report,
+                            format_usage_report, 
+                            create_app, 
+                        )
 
+# Единая настройка логирования для всего приложения
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # убрать шум HTTP-запросов
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Multi-LLM Orchestrator")
+orchestrator_app = create_app()
 
 class SolveTaskRequest(BaseModel):
     task: str

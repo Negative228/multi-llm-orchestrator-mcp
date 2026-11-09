@@ -1,11 +1,22 @@
 # test_client.py
 import asyncio
+import logging
 from langchain_core.callbacks import get_usage_metadata_callback
-from orchestrator import (TaskState, orchestrator_app, format_status_report,
-                          format_usage_report)
+from orchestrator import    (TaskState, 
+                            format_status_report,
+                            format_usage_report, 
+                            create_app, )
+
+# Единая настройка логирования для всего приложения
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # убрать шум HTTP-запросов
 
 async def main():
     task = input("Введите задачу: ")
+    orchestrator_app = create_app()
     initial_state: TaskState = {
         "original_task": task,
         "plan": [],
