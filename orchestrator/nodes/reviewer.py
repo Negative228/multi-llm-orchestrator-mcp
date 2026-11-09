@@ -14,6 +14,9 @@ async def reviewer_node(state: TaskState, config=None):
     reviewer_llm = get_reviewer_llm()
     plan = state["plan"]
     notes = state.get("subtask_reviews") or []
+    next_revision = state.get("revision_count", 0) + 1
+    is_last_iteration = next_revision >= MAX_REVISIONS
+
     context = f"Исходная задача: {state['original_task']}\n\n"
     context += "Результаты выполнения подзадач:\n"
     context += "\n".join(
@@ -24,34 +27,35 @@ async def reviewer_node(state: TaskState, config=None):
         f"{i}. {plan[i]}: {notes[i] if i < len(notes) and notes[i] else 'не проверялось'}"
         for i in range(len(plan))
     )
+    context += f"\n\nИтерация ревью: {next_revision} из {MAX_REVISIONS}."
+    if is_last_iteration:
+        context += "\nЭто последняя итерация: доработок не будет — верни лучший возможный ответ."
     messages = [
         SystemMessage(content=FINAL_REVIEW_SYSTEM),
         HumanMessage(content=context),
     ]
 
     def _validate(review):
-        if review.is_satisfactory and not review.final_answer.strip():
-            raise ValueError("Reviewer одобрил результат, но не вернул итоговый ответ")
+        # Итоговый ответ обязателен, когда результат одобрен или когда доработок больше не будет
+        if (review.is_satisfactory or is_last_iteration) and not review.final_answer.strip():
+            raise ValueError("Reviewer должен вернуть итоговый ответ")
 
-    next_revision = state.get("revision_count", 0) + 1
     try:
         review = await ainvoke_with_retry(reviewer_llm, messages, schema=ReviewResult, validate=_validate)
     except Exception as e:
-        # Итоговая проверка недоступна — возвращаем хотя бы уже полученное
-        logger.error("Итоговое ревью не удалось, возвращаем частичный результат: %s", e)
+        # Ревьюер недоступен даже после ретраев — собираем ответ механически (последний рубеж)
+        logger.error("Итоговое ревью не удалось, собираем ответ механически: %s", e)
         partial = build_partial_answer(state, note=f"итоговая проверка не удалась: {e}")
         if not partial:
             raise
         return {"final_answer": partial, "feedback": f"итоговая проверка не удалась: {e}",
                 "revision_count": next_revision}
 
-    satisfactory = review.is_satisfactory
-    if satisfactory:
+    if review.is_satisfactory:
         return {"final_answer": review.final_answer.strip(), "feedback": None,
                 "revision_count": next_revision}
-    if next_revision >= MAX_REVISIONS:
-        # Итерации исчерпаны — возвращаем частичный результат вместе с замечаниями
-        partial = build_partial_answer(state, note=review.feedback)
-        return {"final_answer": partial or None, "feedback": review.feedback,
+    if is_last_iteration:
+        # Доработок не будет — возвращаем осмысленный ответ ревьюера, даже если он неполный
+        return {"final_answer": review.final_answer.strip(), "feedback": review.feedback,
                 "revision_count": next_revision}
     return {"final_answer": None, "feedback": review.feedback, "revision_count": next_revision}

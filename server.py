@@ -16,6 +16,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)  # убрать шум HTTP-запросов
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Multi-LLM Orchestrator")
