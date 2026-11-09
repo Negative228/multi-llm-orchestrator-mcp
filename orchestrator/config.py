@@ -30,6 +30,17 @@ def get_executor_llm() -> ChatOpenAI:
     )
 
 @lru_cache
+def get_subtask_reviewer_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.environ["SUB_REVIEWER_MODEL"],
+        api_key=os.getenv("SUB_REVIEWER_API_KEY", os.environ["API_KEY"]),
+        base_url=os.getenv("SUB_REVIEWER_BASE_URL", os.environ["BASE_URL"]),
+        temperature=0.1,
+        timeout=120,
+        max_retries=0,
+    )
+
+@lru_cache
 def get_reviewer_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=os.environ["REVIEWER_MODEL"],
@@ -63,8 +74,8 @@ STATUS_REUSED = "REUSED"            # результат переиспольз�
 PLANNER_SYSTEM = """Ты — архитектор. Разбей следующую задачу на последовательность небольших,
 конкретных подзадач, которые сможет выполнить другая, менее мощная модель.
 Подзадачи не должны включать в себя проверку собственных результатов или
-результатов, полученных в других подзадачах, если об этом напрямую
-не указано в формулировке задачи.
+результатов, полученных в других подзадачах, если об этом напрямую не указано в формулировке задачи.
+Также не должно быть подзадачу на сборку итогового ответа.
 Для каждой подзадачи укажи depends_on — индексы подзадач (с 0), результаты которых ей нужны.
 Если подзадачи полностью независимы друг от друга (например, анализ нескольких источников),
 оставь depends_on пустым — тогда они будут выполняться параллельно. Если подзадача строится

@@ -35,6 +35,7 @@ async def executor_node(state: TaskState, config=None):
         })
 
     async def preliminary_review(i: int, result: str, dep_indices: List[int]):
+        sub_reviewer_llm = get_subtask_reviewer_llm()
         # Пошаговая проверка запускается сразу и работает параллельно с выполнением следующих подзадач
         dep_lines = "\n".join(f"{d}. {plan[d]}: {results[d] or '—'}" for d in dep_indices) or "нет"
         # Общая задача: {state['original_task']}
@@ -48,7 +49,7 @@ async def executor_node(state: TaskState, config=None):
         ]
         try:
             async with review_sem:
-                rev = await ainvoke_with_retry(executor_llm, messages, schema=SubtaskReview)
+                rev = await ainvoke_with_retry(sub_reviewer_llm, messages, schema=SubtaskReview)
             if rev.is_satisfactory:
                 reviews[i] = "OK"
                 await set_status(i, STATUS_OK)

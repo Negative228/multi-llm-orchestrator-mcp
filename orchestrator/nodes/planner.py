@@ -31,12 +31,11 @@ async def planner_node(state: TaskState, config=None):
             previous.append(f"{i}. {subtask}\n   Результат: {preview}\n   Предварительная проверка: {note}")
         messages = [
             SystemMessage(content=PLANNER_REPLAN_SYSTEM),
-            HumanMessage(content=f"""Исходная задача: {state['original_task']}
-
-Предыдущий план, результаты подзадач и их предварительная проверка:
-{chr(10).join(previous)}
-
-Замечания ревьюера: {feedback}"""),
+            HumanMessage(content=f"""
+            Исходная задача: {state['original_task']}
+            Предыдущий план, результаты подзадач и их предварительная проверка:
+            {chr(10).join(previous)}
+            Замечания ревьюера: {feedback}"""),
         ]
     else:
         messages = [
