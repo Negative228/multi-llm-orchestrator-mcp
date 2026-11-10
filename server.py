@@ -4,10 +4,11 @@ import logging
 
 from pydantic import BaseModel
 from langchain_core.callbacks import get_usage_metadata_callback
-from orchestrator import    (TaskState, 
+from orchestrator import    (TaskState,
                             format_status_report,
-                            format_usage_report, 
-                            create_app, 
+                            format_usage_report,
+                            format_feedback,
+                            create_app,
                         )
 
 # Единая настройка логирования для всего приложения
@@ -85,7 +86,7 @@ async def solve_task(request: SolveTaskRequest, ctx: Context = None) -> str:
         return f"{report}\n\n=== ОТВЕТ ===\n{result['final_answer']}\n\n{usage}"
     message = f"{report}\n\nНе удалось получить удовлетворительный результат."
     if result.get("feedback"):
-        message += f"\nПоследние замечания ревьюера: {result['feedback']}"
+        message += f"\nПоследние замечания ревьюера:\n{format_feedback(result['feedback'])}"
     return f"{message}\n\n{usage}"
 
 if __name__ == "__main__":

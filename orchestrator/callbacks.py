@@ -34,6 +34,19 @@ def format_status_report(task: str, plan: List[str], statuses: List[str], iterat
         lines.append(f"{i + 1}. {subtask} - \"{status}\"")
     return "\n".join(lines)
 
+def format_feedback(feedback) -> str:
+    """Замечания ревьюера {индекс подзадачи: текст} -> читаемый список."""
+    if not feedback:
+        return "—"
+    if isinstance(feedback, dict):
+        def _key(kv):
+            try:
+                return (0, int(kv[0]))
+            except (TypeError, ValueError):
+                return (1, 0)
+        return "\n".join(f"{idx}. {text}" for idx, text in sorted(feedback.items(), key=_key))
+    return str(feedback)
+
 def format_usage_report(usage_metadata: dict) -> str:
     """Сводка по токенам: usage_metadata из UsageMetadataCallbackHandler -> текст.
 

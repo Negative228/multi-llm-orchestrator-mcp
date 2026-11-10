@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, Dict
 
 class PlannedSubtask(BaseModel):
     description: str = Field(description="Конкретная подзадача для выполнения")
@@ -20,10 +20,17 @@ class Plan(BaseModel):
 class SubtaskReview(BaseModel):
     is_satisfactory: bool = Field(description="Корректно и полно ли выполнена подзадача")
     feedback: str = Field(description="Что именно нужно исправить; пусто, если всё в порядке")
+    can_fix_locally: bool = Field(description="Можно ли устранить проблему повторным выполнением той же "
+                                              "подзадачи с учётом feedback (мелкий баг, неполнота, синтаксическая "
+                                              "или грамматическая ошибка, обрыв/отказ модели). False — проблема "
+                                              "глобальная (подзадача не понята, неверный подход, результат не по "
+                                              "теме) — потребуется перепланирование")
 
 class ReviewResult(BaseModel):
     is_satisfactory: bool = Field(description="Удовлетворителен ли итоговый результат")
-    feedback: str = Field(description="Что именно не так и какие подзадачи нужно перепланировать/переделать; пусто, если всё в порядке")
+    feedback: Dict[int, str] = Field(description="Замечания по подзадачам в формате "
+                                                "{\"индекс подзадачи (с 0)\": \"что именно не так и что нужно "
+                                                "перепланировать/переделать\"}; пустой словарь, если всё в порядке")
     final_answer: str = Field(description="Итоговый ответ пользователю: результаты подзадач, объединённые в один цельный "
                                           "ответ без повторов и дублирования кода (каждый фрагмент кода — только один раз). "
                                           "Заполняй, когда результат удовлетворителен; на последней итерации — всегда "

@@ -7,7 +7,7 @@ from .config import *
 
 logger = logging.getLogger(__name__)
 
-async def ainvoke_with_retry(llm, messages, schema=None, validate=None, max_attempts=MAX_LLM_ATTEMPTS):
+async def ainvoke_with_retry(llm, messages, schema=None, validate=None, max_attempts=MAX_LLM_ATTEMPTS, description=""):
     """Вызов LLM с повторами при ошибках API, пустом ответе и некорректном JSON.
 
     messages — строка или список сообщений (SystemMessage + HumanMessage):
@@ -27,7 +27,7 @@ async def ainvoke_with_retry(llm, messages, schema=None, validate=None, max_atte
             return result
         except Exception as e:
             last_error = e
-            logger.warning("Вызов LLM (попытка %d/%d) не удался: %s", attempt, max_attempts, e)
+            logger.warning("Вызов LLM (%s попытка %d/%d) не удался: %s", description or "без описания", attempt, max_attempts, e)
             if attempt < max_attempts:
                 await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
     raise RuntimeError(f"LLM не ответила после {max_attempts} попыток: {last_error}") from last_error

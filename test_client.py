@@ -2,9 +2,10 @@
 import asyncio
 import logging
 from langchain_core.callbacks import get_usage_metadata_callback
-from orchestrator import    (TaskState, 
+from orchestrator import    (TaskState,
                             format_status_report,
-                            format_usage_report, 
+                            format_usage_report,
+                            format_feedback,
                             create_app, )
 
 # Единая настройка логирования для всего приложения
@@ -55,7 +56,7 @@ async def main():
     else:
         print("Не удалось получить результат.")
         if result.get("feedback"):
-            print(f"\nПоследние замечания ревьюера: {result['feedback']}")
+            print(f"\nПоследние замечания ревьюера:\n{format_feedback(result['feedback'])}")
     print(f"\n(итераций ревью: {result['revision_count']})")
     print()
     print(format_usage_report(usage_cb.usage_metadata if usage_cb else {}))
